@@ -1,0 +1,17 @@
+[package]
+name = "preludio"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.70"
+description = "On-device radar nowcasting — Forecast the rain before it begins, right on your device."
+license = "Apache-2.0"
+repository = "https://github.com/chorust/preludio"
+homepage = "https://github.com/chorust/preludio"
+documentation = "https://docs.rs/preludio"
+readme = "README.md"
+keywords = ["radar", "nowcasting", "on-device", "weather", "wasm"]
+categories = ["science", "wasm", "multimedia"]
+exclude = [".git*", ".gitignore"]
+
+[lib]
+path = "src/lib.rs"
