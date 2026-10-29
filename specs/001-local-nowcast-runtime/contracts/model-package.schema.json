@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chorust/preludio/schemas/model-package.schema.json",
+  "title": "Preludio model package manifest (preludio.model-package/1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "model", "origin", "observation", "tensor_input", "tensor_output", "preprocessing", "forecast", "supported_targets"],
+  "properties": {
+    "schema": { "const": "preludio.model-package/1" },
+    "id": { "type": "string", "minLength": 1, "description": "Human-readable model id; never used for identity checks." },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "sha256", "format", "opset"],
+      "properties": {
+        "file": { "type": "string", "description": "Path relative to the package directory." },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "format": { "const": "onnx" },
+        "opset": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkpoint", "source_sha256", "config_sha256", "exporter"],
+      "properties": {
+        "checkpoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["file", "step", "sha256", "run"],
+          "properties": {
+            "file": { "type": "string" },
+            "step": { "type": "integer" },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "run": { "type": "string", "description": "Training run id, e.g. ghost_unet3d_wmse/2026-10-23_23-54-23." }
+          }
+        },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "config_sha256": { "$ref": "#/$defs/sha256" },
+        "exporter": { "type": "string", "description": "Exporter tool and version, e.g. tools/export_ghost_unet3d.py@<git sha>." }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frames", "cadence_seconds", "cadence_tolerance_seconds", "encoding", "grid", "missing_policy"],
+      "properties": {
+        "frames": { "type": "integer", "minimum": 1 },
+        "cadence_seconds": { "type": "integer", "minimum": 1, "description": "Training/reference cadence only; runtime accepts strictly ordered input timestamps without enforcing a fixed or uniform interval." },
+        "cadence_tolerance_seconds": { "type": "integer", "minimum": 0, "description": "Training/reference metadata only; not used to reject runtime input." },
+        "encoding": { "$ref": "#/$defs/encodingId" },
+        "grid": { "$ref": "#/$defs/grid", "description": "Training/reference grid only. Runtime raw frames may use any common positive [height, width]; preprocessing resizes to model dimensions. No geographic reference is required." },
+        "missing_policy": { "enum": ["reject"], "description": "Only 'reject' is defined in schema version 1." }
+      }
+    },
+    "tensor_input": { "$ref": "#/$defs/tensor" },
+    "tensor_output": { "$ref": "#/$defs/tensor" },
+    "preprocessing": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          { "type": "object", "additionalProperties": false, "required": ["op"], "properties": { "op": { "const": "u8_div_255" } } },
+          {
+            "type": "object", "additionalProperties": false, "required": ["op", "height", "width"],
+            "properties": {
+              "op": { "const": "resize_bilinear_aa" },
+              "height": { "type": "integer", "minimum": 1 },
+              "width": { "type": "integer", "minimum": 1 },
+              "align_corners": { "const": false }
+            }
+          },
+          { "type": "object", "additionalProperties": false, "required": ["op"], "properties": { "op": { "const": "round_f16" } } }
+        ]
+      }
+    },
+    "forecast": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lead_minutes", "encoding", "grid"],
+      "properties": {
+        "lead_minutes": { "type": "array", "minItems": 1, "items": { "type": "integer", "minimum": 1 }, "description": "Training/reference leads only. Runtime output leads are derived from the mean interval of the actual input timestamps." },
+        "encoding": { "$ref": "#/$defs/encodingId" },
+        "grid": { "$ref": "#/$defs/grid" }
+      }
+    },
+    "supported_targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "platform", "engine", "engine_version", "provider", "threads", "requires_cross_origin_isolation", "validation", "measurement"],
+        "properties": {
+          "id": { "type": "string" },
+          "platform": { "type": "string", "description": "e.g. macos-arm64, web-chrome." },
+          "engine": { "enum": ["onnxruntime", "onnxruntime-web"] },
+          "engine_version": { "type": "string" },
+          "provider": { "enum": ["cpu", "wasm"] },
+          "threads": { "oneOf": [{ "const": "default" }, { "type": "integer", "minimum": 1 }] },
+          "requires_cross_origin_isolation": { "type": "boolean" },
+          "validation": { "type": "string", "description": "Relative path to a ValidationRecord (validation-record.schema.json)." },
+          "measurement": { "type": "string", "description": "Relative path to a MeasurementRecord (validation-record.schema.json#/$defs/measurement)." }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "encodingId": {
+      "enum": ["training-grayscale-u8", "training-grayscale-normalized"],
+      "description": "training-grayscale-u8 means raw single-channel 0..255 grayscale matching duckomo gray mode; valid no-echo is 0. An optional observation zero_threshold zeros values strictly below it before normalization and resize. training-grayscale-normalized is its normalized output representation, not dBZ, rain rate or probability."
+    },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "shape", "georeferenced"],
+      "properties": {
+        "id": { "type": "string" },
+        "shape": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 2, "maxItems": 2 },
+        "georeferenced": { "type": "boolean" },
+        "crs": { "type": "string" },
+        "affine": { "type": "array", "items": { "type": "number" }, "minItems": 6, "maxItems": 6 }
+      },
+      "if": { "properties": { "georeferenced": { "const": true } } },
+      "then": { "required": ["crs", "affine"] }
+    },
+    "tensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "dtype", "shape", "axes", "range"],
+      "properties": {
+        "name": { "type": "string" },
+        "dtype": { "const": "float32" },
+        "shape": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+        "axes": { "type": "array", "items": { "enum": ["batch", "time", "lead_time", "y", "x"] } },
+        "range": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema": "preludio.model-package/1",
+      "id": "ghost-unet3d-step-22000",
+      "model": { "file": "model.onnx", "sha256": "7c5a6ed7865c0c85054ce45b2fb0b2f66694453491f7e6acabba14ee51533de8", "format": "onnx", "opset": 18 },
+      "origin": {
+        "checkpoint": { "file": "step_22000.ckpt", "step": 22000, "sha256": "c5d8b457ad603ff53502616e97cc048aee0b22ded033b91acc5742b88fbc4a12", "run": "ghost_unet3d_wmse/2026-10-23_23-54-23" },
+        "source_sha256": "366e590ec938e391c6a43f796254c8836915f1817e3250ba6eee3011254ff07d",
+        "config_sha256": "3b8b6dc349d78e840f086d4e78d3e374e31059a25a582525242008b040d09599",
+        "exporter": "tools/export_ghost_unet3d.py"
+      },
+      "observation": {
+        "frames": 4, "cadence_seconds": 360, "cadence_tolerance_seconds": 0,
+        "encoding": "training-grayscale-u8",
+        "grid": { "id": "onix-station-png-732", "shape": [732, 732], "georeferenced": false },
+        "missing_policy": "reject"
+      },
+      "tensor_input": { "name": "radar", "dtype": "float32", "shape": [1, 4, 448, 448], "axes": ["batch", "time", "y", "x"], "range": [0, 1] },
+      "tensor_output": { "name": "forecast", "dtype": "float32", "shape": [1, 20, 448, 448], "axes": ["batch", "lead_time", "y", "x"], "range": [0, 1] },
+      "preprocessing": [ { "op": "u8_div_255" }, { "op": "resize_bilinear_aa", "height": 448, "width": 448, "align_corners": false }, { "op": "round_f16" } ],
+      "forecast": {
+        "lead_minutes": [6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90, 96, 102, 108, 114, 120],
+        "encoding": "training-grayscale-normalized",
+        "grid": { "id": "onix-station-png-732/448", "shape": [448, 448], "georeferenced": false }
+      },
+      "supported_targets": [
+        { "id": "macos-arm64-ort-cpu", "platform": "macos-arm64", "engine": "onnxruntime", "engine_version": "1.31.0", "provider": "cpu", "threads": "default", "requires_cross_origin_isolation": false, "validation": "reference/validation-macos-arm64-ort-cpu.json", "measurement": "reference/measurement-macos-arm64-ort-cpu.json" }
+      ]
+    }
+  ]
+}

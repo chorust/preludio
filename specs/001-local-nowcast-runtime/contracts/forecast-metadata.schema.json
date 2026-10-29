@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chorust/preludio/schemas/forecast-metadata.schema.json",
+  "title": "Preludio forecast metadata (values travel separately as f32 [leads, h, w])",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "encoding",
+    "grid",
+    "lead_minutes",
+    "valid_times",
+    "provenance"
+  ],
+  "properties": {
+    "kind": {
+      "const": "forecast"
+    },
+    "encoding": {
+      "const": "training-grayscale-normalized",
+      "description": "Never dBZ, rain rate, or probability until a verified mapping exists."
+    },
+    "grid": {
+      "$ref": "model-package.schema.json#/$defs/grid"
+    },
+    "lead_minutes": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "exclusiveMinimum": 0
+      },
+      "description": "For lead index k starting at 1, round(k * (last input time - first input time) / (input frame count - 1)) seconds, then divide by 60. Fractional minutes are allowed; output count follows tensor_output.shape[1]."
+    },
+    "valid_times": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/utc"
+      },
+      "description": "last_observation_time + lead; same length as lead_minutes."
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_frames",
+        "last_observation_time",
+        "model",
+        "generated_at",
+        "execution",
+        "preludio_version"
+      ],
+      "properties": {
+        "input_frames": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "source",
+              "valid_time"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "valid_time": {
+                "$ref": "#/$defs/utc"
+              }
+            }
+          }
+        },
+        "last_observation_time": {
+          "$ref": "#/$defs/utc"
+        },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "sha256",
+            "schema"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "sha256": {
+              "$ref": "model-package.schema.json#/$defs/sha256"
+            },
+            "schema": {
+              "const": "preludio.model-package/1"
+            }
+          }
+        },
+        "generated_at": {
+          "$ref": "#/$defs/utc",
+          "description": "When inference finished; never substitutes for valid_times."
+        },
+        "execution": {
+          "$ref": "#/$defs/execution"
+        },
+        "preludio_version": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_id",
+        "verified",
+        "engine",
+        "engine_version",
+        "provider",
+        "threads",
+        "platform"
+      ],
+      "properties": {
+        "target_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verified": {
+          "type": "boolean"
+        },
+        "engine": {
+          "enum": [
+            "onnxruntime",
+            "onnxruntime-web"
+          ]
+        },
+        "engine_version": {
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "cpu",
+            "wasm"
+          ]
+        },
+        "threads": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "platform": {
+          "type": "string"
+        },
+        "cross_origin_isolated": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "kind": "forecast",
+      "encoding": "training-grayscale-normalized",
+      "grid": {
+        "id": "onix-station-png-732/448",
+        "shape": [
+          448,
+          448
+        ],
+        "georeferenced": false
+      },
+      "lead_minutes": [
+        6,
+        12,
+        18,
+        24,
+        30,
+        36,
+        42,
+        48,
+        54,
+        60,
+        66,
+        72,
+        78,
+        84,
+        90,
+        96,
+        102,
+        108,
+        114,
+        120
+      ],
+      "valid_times": [
+        "2023-11-30T09:48:00Z",
+        "2023-11-30T09:54:00Z",
+        "2023-11-30T10:00:00Z",
+        "2023-11-30T10:06:00Z",
+        "2023-11-30T10:12:00Z",
+        "2023-11-30T10:18:00Z",
+        "2023-11-30T10:24:00Z",
+        "2023-11-30T10:30:00Z",
+        "2023-11-30T10:36:00Z",
+        "2023-11-30T10:42:00Z",
+        "2023-11-30T10:48:00Z",
+        "2023-11-30T10:54:00Z",
+        "2023-11-30T11:00:00Z",
+        "2023-11-30T11:06:00Z",
+        "2023-11-30T11:12:00Z",
+        "2023-11-30T11:18:00Z",
+        "2023-11-30T11:24:00Z",
+        "2023-11-30T11:30:00Z",
+        "2023-11-30T11:36:00Z",
+        "2023-11-30T11:42:00Z"
+      ],
+      "provenance": {
+        "input_frames": [
+          {
+            "id": "AZ9002_20231130_092400Z",
+            "source": "onix-png/AZ9002",
+            "valid_time": "2023-11-30T09:24:00Z"
+          },
+          {
+            "id": "AZ9002_20231130_093000Z",
+            "source": "onix-png/AZ9002",
+            "valid_time": "2023-11-30T09:30:00Z"
+          },
+          {
+            "id": "AZ9002_20231130_093600Z",
+            "source": "onix-png/AZ9002",
+            "valid_time": "2023-11-30T09:36:00Z"
+          },
+          {
+            "id": "AZ9002_20231130_094200Z",
+            "source": "onix-png/AZ9002",
+            "valid_time": "2023-11-30T09:42:00Z"
+          }
+        ],
+        "last_observation_time": "2023-11-30T09:42:00Z",
+        "model": {
+          "id": "ghost-unet3d-step-22000",
+          "sha256": "7c5a6ed7865c0c85054ce45b2fb0b2f66694453491f7e6acabba14ee51533de8",
+          "schema": "preludio.model-package/1"
+        },
+        "generated_at": "2026-10-24T12:00:03Z",
+        "execution": {
+          "target_id": "macos-arm64-ort-cpu",
+          "verified": true,
+          "engine": "onnxruntime",
+          "engine_version": "1.31.0",
+          "provider": "cpu",
+          "threads": 10,
+          "platform": "macos-arm64"
+        },
+        "preludio_version": "0.1.0"
+      }
+    }
+  ]
+}

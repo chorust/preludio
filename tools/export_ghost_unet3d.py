@@ -14,9 +14,9 @@ import time
 import numpy as np
 import onnx
 import onnxruntime as ort
-from onnxscript import opset18 as op
-from omegaconf import OmegaConf
 import torch
+
+from model_package import build_manifest, validate_manifest
 
 
 def network_weights(state_dict):
@@ -40,40 +40,88 @@ def load_input(path, shape):
     return np.ascontiguousarray(values)
 
 
-def onnx_group_norm(input, num_groups: int, weight, bias, eps: float = 1e-5, cudnn_enabled: bool = True):
-    grouped = op.Reshape(input, [0, num_groups, -1, *input.shape[2:]])
-    # Small reductions avoid accumulation error across millions of spatial values.
-    mean = grouped
-    for axis in range(len(input.shape), 1, -1):
-        mean = op.ReduceMean(mean, [axis], keepdims=1)
-    centered = grouped - mean
-    variance = centered * centered
-    for axis in range(len(input.shape), 1, -1):
-        variance = op.ReduceMean(variance, [axis], keepdims=1)
-    normalized = op.Reshape(centered / op.Sqrt(variance + eps), op.Shape(input))
-    affine_shape = [1, -1] + [1] * (len(input.shape) - 2)
-    return normalized * op.Reshape(weight, affine_shape) + op.Reshape(bias, affine_shape)
+def write_export_artifacts(output, values, reference, forecast, report, manifest):
+    reference_dir = output / "reference"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    np.save(reference_dir / "input.npy", values, allow_pickle=False)
+    np.save(reference_dir / "reference.npy", reference, allow_pickle=False)
+    np.save(reference_dir / "forecast.npy", forecast, allow_pickle=False)
+    (reference_dir / "validation.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    manifest_path = output / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    validate_manifest(manifest_path)
+
+
+class _ExportGroupNorm(torch.nn.Module):
+    def __init__(self, group_norm):
+        super().__init__()
+        self.num_groups = group_norm.num_groups
+        self.eps = group_norm.eps
+        self.weight = group_norm.weight
+        self.bias = group_norm.bias
+
+    def forward(self, input):
+        grouped = input.reshape(input.shape[0], self.num_groups, -1, *input.shape[2:])
+        mean = grouped
+        for axis in range(input.dim(), 1, -1):
+            mean = mean.mean(dim=axis, keepdim=True)
+        centered = grouped - mean
+        variance = centered * centered
+        for axis in range(input.dim(), 1, -1):
+            variance = variance.mean(dim=axis, keepdim=True)
+        normalized = (centered / torch.sqrt(variance + self.eps)).reshape(input.shape)
+        if self.weight is not None:
+            affine_shape = [1, -1] + [1] * (input.dim() - 2)
+            normalized = normalized * self.weight.reshape(affine_shape)
+            normalized = normalized + self.bias.reshape(affine_shape)
+        return normalized
+
+
+def _replace_group_norms(module):
+    replacements = []
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.GroupNorm):
+            replacements.append((module, name, child))
+            setattr(module, name, _ExportGroupNorm(child))
+        else:
+            replacements.extend(_replace_group_norms(child))
+    return replacements
 
 
 def export_model(model, tensor, path):
-    # InstanceNormalization lowering loses CPU precision over these large groups.
-    torch.onnx.export(
-        model, (tensor,), path,
-        input_names=["radar"], output_names=["forecast"],
-        opset_version=18, dynamo=True, external_data=False,
-        custom_translation_table={torch.ops.aten.group_norm.default: onnx_group_norm},
-    )
+    # Decompose GroupNorm into reductions to avoid inaccurate InstanceNormalization lowering.
+    if isinstance(model, torch.nn.GroupNorm):
+        exportable_model = _ExportGroupNorm(model)
+        replacements = []
+    else:
+        exportable_model = model
+        replacements = _replace_group_norms(model)
+    try:
+        torch.onnx.export(
+            exportable_model, (tensor,), path,
+            input_names=["radar"], output_names=["forecast"],
+            opset_version=18, dynamo=False, external_data=False,
+        )
+    finally:
+        for parent, name, group_norm in reversed(replacements):
+            setattr(parent, name, group_norm)
 
 
 def main():
+    from omegaconf import OmegaConf
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--onix-root", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--run", required=True, help="Training run identifier recorded in checkpoint provenance")
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--input", type=Path, help="Already preprocessed float32 [1, 4, 448, 448] .npy")
     parser.add_argument("--output", type=Path, default=Path("artifacts/ghost-unet3d"))
     parser.add_argument("--threads", type=int, default=4)
     args = parser.parse_args()
+    if not args.run.strip():
+        parser.error("--run must not be blank")
     if args.threads < 1:
         parser.error("--threads must be positive")
     if args.output.exists() and any(args.output.iterdir()):
@@ -86,6 +134,10 @@ def main():
         raise ValueError("This exporter only supports Onix GhostUNet3D")
     if config.datamodule._target_ != "onix.datamodules.radar_video.RadarPngVideoDataModule":
         raise ValueError("This exporter only describes normalized PNG training inputs")
+    if config.datamodule.rot != 0:
+        raise ValueError("This exporter requires datamodule.rot = 0 (no rotation)")
+    if config.datamodule.transport_dtype != "float16":
+        raise ValueError("This exporter requires datamodule.transport_dtype = float16")
     height, width = config.datamodule.resize_size
     input_shape = [1, model_config["in_frames"], height, width]
     output_shape = [1, model_config["out_frames"], height, width]
@@ -134,32 +186,60 @@ def main():
     if not np.isfinite(reference).all() or not np.isfinite(actual).all():
         raise ValueError("Forecast contains non-finite values")
     np.testing.assert_allclose(actual, reference, rtol=1e-4, atol=1e-5)
-    np.save(args.output / "input.npy", values, allow_pickle=False)
-    np.save(args.output / "reference.npy", reference, allow_pickle=False)
-    np.save(args.output / "forecast.npy", actual, allow_pickle=False)
-
     frame_minutes = int(config.datamodule.frame_minutes)
-    manifest = {
-        "id": f"ghost-unet3d-step-{step}",
-        "model": "model.onnx",
-        "sha256": hashlib.sha256((args.output / "model.onnx").read_bytes()).hexdigest(),
-        "checkpoint": {"file": args.checkpoint.name, "step": step, "sha256": checkpoint_hash},
-        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
-        "model_config": model_config,
-        "input": {"name": "radar", "dtype": "float32", "shape": input_shape,
-                  "axes": ["batch", "time", "y", "x"], "range": [0, 1],
-                  "time_order": "oldest_to_newest", "frame_minutes": frame_minutes},
-        "output": {"name": "forecast", "dtype": "float32", "shape": output_shape,
-                   "axes": ["batch", "lead_time", "y", "x"], "range": [0, 1],
-                   "lead_minutes": list(range(frame_minutes, frame_minutes * output_shape[1] + 1, frame_minutes))},
-        "preprocessing": {"encoding": "training_grayscale_png_uint8_div_255",
-                          "resize": "bilinear_float32_antialias_align_corners_false",
-                          "rotation_quarter_turns": int(config.datamodule.rot),
-                          "training_transport_dtype": str(config.datamodule.transport_dtype),
-                          "physical_dbz_mapping": None, "georeferencing": None},
-        "validated_providers": ["CPUExecutionProvider"],
-    }
+    model_sha256 = hashlib.sha256((args.output / "model.onnx").read_bytes()).hexdigest()
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+    opset_version = next(
+        imported_opset.version
+        for imported_opset in graph.opset_import
+        if imported_opset.domain in ("", "ai.onnx")
+    )
+    forecast_grid_id = (
+        f"onix-station-png-732/{height}"
+        if width == height
+        else f"onix-station-png-732/{height}x{width}"
+    )
+    manifest = build_manifest(
+        model_id=f"ghost-unet3d-step-{step}",
+        model={"file": "model.onnx", "sha256": model_sha256, "format": "onnx",
+               "opset": opset_version},
+        origin={
+            "checkpoint": {"file": args.checkpoint.name, "step": int(step),
+                           "sha256": checkpoint_hash,
+                           "run": args.run},
+            "source_sha256": source_sha256,
+            "config_sha256": config_sha256,
+            "exporter": "tools/export_ghost_unet3d.py",
+        },
+        observation={
+            "frames": int(model_config["in_frames"]),
+            "cadence_seconds": frame_minutes * 60,
+            "cadence_tolerance_seconds": 0,
+            "encoding": "training-grayscale-u8",
+            "grid": {"id": "onix-station-png-732", "shape": [732, 732],
+                     "georeferenced": False},
+            "missing_policy": "reject",
+        },
+        tensor_input={"name": "radar", "dtype": "float32", "shape": input_shape,
+                      "axes": ["batch", "time", "y", "x"], "range": [0.0, 1.0]},
+        tensor_output={"name": "forecast", "dtype": "float32", "shape": output_shape,
+                       "axes": ["batch", "lead_time", "y", "x"], "range": [0.0, 1.0]},
+        preprocessing=[
+            {"op": "u8_div_255"},
+            {"op": "resize_bilinear_aa", "height": height, "width": width,
+             "align_corners": False},
+            {"op": "round_f16"},
+        ],
+        forecast={
+            "lead_minutes": list(
+                range(frame_minutes, frame_minutes * output_shape[1] + 1, frame_minutes)
+            ),
+            "encoding": "training-grayscale-normalized",
+            "grid": {"id": forecast_grid_id, "shape": [height, width],
+                     "georeferenced": False},
+        },
+    )
     error = np.abs(actual - reference)
     report = {
         "input_source": str(args.input.resolve()) if args.input else "synthetic_uniform_seed_42",
@@ -175,8 +255,7 @@ def main():
         "onnx_opsets": {op.domain or "ai.onnx": op.version for op in graph.opset_import},
         "onnx_operators": dict(sorted(Counter(node.op_type for node in graph.graph.node).items())),
     }
-    (args.output / "validation.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    write_export_artifacts(args.output, values, reference, actual, report, manifest)
     print(json.dumps(report, indent=2))
 
 

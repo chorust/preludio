@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ONNX Runtime Web WASM browser spike</title>
+  <style>
+    body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>ONNX Runtime Web browser spike</h1>
+  <pre id="status">Starting…</pre>
+  <script src="node_modules/onnxruntime-web/dist/ort.min.js"></script>
+  <script>
+    (() => {
+      const output = document.querySelector('#status');
+      const params = new URLSearchParams(location.search);
+      const threadChoice = params.get('threads') || 'default';
+      const requestedThreads = threadChoice === 'default' ? 0 : Number(threadChoice);
+      const useProxy = params.get('proxy') === '1';
+      const ep = params.get('ep') || 'wasm';
+      const tolerance = { absolute: 1e-5, relative: 1e-4 };
+      const fmtMiB = (bytes) => bytes == null ? null : Math.round(bytes / 1048576 * 100) / 100;
+
+      function parseNpy(buffer) {
+        const bytes = new Uint8Array(buffer);
+        if (bytes[0] !== 0x93 || String.fromCharCode(...bytes.subarray(1, 6)) !== 'NUMPY') {
+          throw new Error('Invalid NPY magic');
+        }
+        const major = bytes[6];
+        let headerLength;
+        let headerStart;
+        if (major === 1) {
+          headerLength = new DataView(buffer).getUint16(8, true);
+          headerStart = 10;
+        } else if (major === 2 || major === 3) {
+          headerLength = new DataView(buffer).getUint32(8, true);
+          headerStart = 12;
+        } else {
+          throw new Error(`Unsupported NPY version ${major}.${bytes[7]}`);
+        }
+        const header = new TextDecoder().decode(bytes.subarray(headerStart, headerStart + headerLength));
+        const descr = header.match(/['"]descr['"]\s*:\s*['"]([^'"]+)['"]/)[1];
+        const shapeText = header.match(/['"]shape['"]\s*:\s*\(([^)]*)\)/)[1];
+        const shape = shapeText.split(',').map(s => s.trim()).filter(Boolean).map(Number);
+        const count = shape.reduce((a, b) => a * b, 1);
+        const offset = headerStart + headerLength;
+        let data;
+        if (descr.endsWith('f4')) {
+          if (descr.startsWith('>')) throw new Error(`Big-endian NPY not supported: ${descr}`);
+          data = new Float32Array(buffer, offset, count);
+        } else if (descr.endsWith('f8')) {
+          if (descr.startsWith('>')) throw new Error(`Big-endian NPY not supported: ${descr}`);
+          data = new Float64Array(buffer, offset, count);
+        } else {
+          throw new Error(`Unsupported NPY dtype: ${descr}`);
+        }
+        return { data, shape, descr, fortranOrder: /fortran_order['"]?\s*:\s*True/.test(header) };
+      }
+
+      function summarizeErrors(actual, expected) {
+        if (actual.length !== expected.length) throw new Error(`Output length ${actual.length} != reference length ${expected.length}`);
+        let maxAbs = 0;
+        let sumAbs = 0;
+        let failures = 0;
+        for (let i = 0; i < actual.length; i++) {
+          const abs = Math.abs(actual[i] - expected[i]);
+          if (abs > maxAbs) maxAbs = abs;
+          sumAbs += abs;
+          if (abs > tolerance.absolute + tolerance.relative * Math.abs(expected[i])) failures++;
+        }
+        return { maxAbs, meanAbs: sumAbs / actual.length, failures, count: actual.length, tolerance };
+      }
+
+      async function memorySnapshot() {
+        const result = {};
+        if (params.get('uaMemory') === '0') {
+          result.userAgentSpecificSkipped = true;
+        } else if (typeof performance.measureUserAgentSpecificMemory === 'function') {
+          try {
+            const measurement = await performance.measureUserAgentSpecificMemory();
+            result.userAgentSpecificBytes = measurement.bytes;
+            result.userAgentSpecificMiB = fmtMiB(measurement.bytes);
+          } catch (error) {
+            result.userAgentSpecificError = String(error);
+          }
+        } else {
+          result.userAgentSpecificUnavailable = true;
+        }
+        if (performance.memory) {
+          result.performanceMemory = {
+            usedJSHeapSize: performance.memory.usedJSHeapSize,
+            totalJSHeapSize: performance.memory.totalJSHeapSize,
+            jsHeapSizeLimit: performance.memory.jsHeapSizeLimit,
+            usedJSHeapMiB: fmtMiB(performance.memory.usedJSHeapSize),
+            totalJSHeapMiB: fmtMiB(performance.memory.totalJSHeapSize),
+            limitMiB: fmtMiB(performance.memory.jsHeapSizeLimit)
+          };
+        } else {
+          result.performanceMemoryUnavailable = true;
+        }
+        return result;
+      }
+
+      function beginResponsivenessProbe() {
+        const gaps = [];
+        let last = 0;
+        let active = true;
+        let frameCount = 0;
+        const tick = (timestamp) => {
+          if (last) gaps.push(timestamp - last);
+          last = timestamp;
+          frameCount++;
+          if (active) requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+        return {
+          async ready() { await new Promise(resolve => requestAnimationFrame(resolve)); },
+          stop() { active = false; },
+          snapshot() {
+            return {
+              frames: frameCount,
+              samples: gaps.length,
+              maxRAFGapMs: gaps.length ? Math.max(...gaps) : null,
+              meanRAFGapMs: gaps.length ? gaps.reduce((sum, x) => sum + x, 0) / gaps.length : null
+            };
+          }
+        };
+      }
+
+      async function run() {
+        const totalStart = performance.now();
+        const longTasks = [];
+        let inferenceStart = null;
+        let longTaskObserver;
+        if (typeof PerformanceObserver !== 'undefined' && PerformanceObserver.supportedEntryTypes?.includes('longtask')) {
+          longTaskObserver = new PerformanceObserver(list => {
+            for (const entry of list.getEntries()) {
+              if (inferenceStart == null || entry.startTime + entry.duration >= inferenceStart) {
+                longTasks.push({ startTimeMs: entry.startTime, durationMs: entry.duration });
+              }
+            }
+          });
+          longTaskObserver.observe({ type: 'longtask', buffered: true });
+        }
+
+        const longTaskSupported = typeof PerformanceObserver !== 'undefined' && PerformanceObserver.supportedEntryTypes?.includes('longtask');
+        const result = {
+          status: 'running',
+          packageVersion: '1.30.0',
+          browser: navigator.userAgent,
+          hardwareConcurrency: navigator.hardwareConcurrency,
+          crossOriginIsolated: self.crossOriginIsolated,
+          executionProvider: ep,
+          threadChoice,
+          requestedThreads,
+          proxy: useProxy,
+          longTaskSupported,
+          dataFetch: {},
+          sessionSeconds: null,
+          coldSeconds: null,
+          warmSeconds: [],
+          firstResultSecondsFromFetchStart: null,
+          actualNumThreadsAfterSession: null,
+          inferenceResponsiveness: null,
+          memory: null,
+          wasmResources: [],
+          parity: null,
+          error: null
+        };
+        window.RESULT = result;
+        output.textContent = JSON.stringify(result, null, 2);
+
+        try {
+          ort.env.wasm.wasmPaths = new URL('node_modules/onnxruntime-web/dist/', location.href).href;
+          ort.env.wasm.proxy = useProxy;
+          ort.env.wasm.numThreads = requestedThreads;
+          const fetchStart = performance.now();
+          const [modelResponse, inputResponse, referenceResponse] = await Promise.all([
+            fetch('model.onnx'), fetch('input.npy'), fetch('reference.npy')
+          ]);
+          for (const [name, response] of [['model', modelResponse], ['input', inputResponse], ['reference', referenceResponse]]) {
+            if (!response.ok) throw new Error(`${name} fetch failed: ${response.status}`);
+          }
+          const [modelBuffer, inputBuffer, referenceBuffer] = await Promise.all([
+            modelResponse.arrayBuffer(), inputResponse.arrayBuffer(), referenceResponse.arrayBuffer()
+          ]);
+          const assetsReady = performance.now();
+          result.dataFetch = {
+            modelBytes: modelBuffer.byteLength,
+            inputBytes: inputBuffer.byteLength,
+            referenceBytes: referenceBuffer.byteLength,
+            fetchAndReadSeconds: (assetsReady - fetchStart) / 1000
+          };
+          const inputNpy = parseNpy(inputBuffer);
+          const referenceNpy = parseNpy(referenceBuffer);
+          result.inputNpy = { shape: inputNpy.shape, dtype: inputNpy.descr };
+          result.referenceNpy = { shape: referenceNpy.shape, dtype: referenceNpy.descr };
+          const makeInputTensor = () => new ort.Tensor('float32', Float32Array.from(inputNpy.data), inputNpy.shape);
+          const inputTensor = makeInputTensor();
+          const runInput = () => useProxy ? makeInputTensor() : inputTensor;
+          const sessionStart = performance.now();
+          const session = await ort.InferenceSession.create(modelBuffer, { executionProviders: [ep] });
+          result.sessionSeconds = (performance.now() - sessionStart) / 1000;
+          result.actualNumThreadsAfterSession = ort.env.wasm.numThreads;
+          result.inputNames = session.inputNames;
+          result.outputNames = session.outputNames;
+          result.wasmInitialized = ort.env.wasm.initialized;
+
+          if (ep === 'webgpu') {
+            inferenceStart = performance.now();
+            const webgpuOutputs = await session.run({ radar: inputTensor });
+            result.webgpuRunSeconds = (performance.now() - inferenceStart) / 1000;
+            result.parity = summarizeErrors(webgpuOutputs.forecast.data, referenceNpy.data);
+            result.status = 'complete';
+            result.firstResultSecondsFromFetchStart = (performance.now() - fetchStart) / 1000;
+            result.memory = await memorySnapshot();
+            result.wasmResources = performance.getEntriesByType('resource')
+              .filter(entry => entry.name.endsWith('.wasm'))
+              .map(entry => ({ name: entry.name, transferSize: entry.transferSize, encodedBodySize: entry.encodedBodySize, durationMs: entry.duration }));
+            return finish(result, output, longTaskObserver);
+          }
+
+          const responsiveness = beginResponsivenessProbe();
+          await responsiveness.ready();
+          inferenceStart = performance.now();
+          const coldStart = performance.now();
+          let outputs = await session.run({ radar: runInput() });
+          result.coldSeconds = (performance.now() - coldStart) / 1000;
+          result.firstResultSecondsFromFetchStart = (performance.now() - fetchStart) / 1000;
+          result.parity = summarizeErrors(outputs.forecast.data, referenceNpy.data);
+          outputs = null;
+          for (let i = 0; i < 5; i++) {
+            const start = performance.now();
+            const warmOutputs = await session.run({ radar: runInput() });
+            result.warmSeconds.push((performance.now() - start) / 1000);
+            if (i === 4) result.parity = summarizeErrors(warmOutputs.forecast.data, referenceNpy.data);
+          }
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          responsiveness.stop();
+          result.inferenceResponsiveness = responsiveness.snapshot();
+          if (longTaskObserver) {
+            for (const entry of longTaskObserver.takeRecords()) {
+              longTasks.push({ startTimeMs: entry.startTime, durationMs: entry.duration });
+            }
+          }
+          result.inferenceResponsiveness.longTasks = longTasks
+            .filter(entry => inferenceStart !== null && entry.startTimeMs >= inferenceStart);
+          result.inferenceResponsiveness.longTaskCount = result.inferenceResponsiveness.longTasks.length;
+          result.inferenceResponsiveness.maxLongTaskMs = result.inferenceResponsiveness.longTasks.length
+            ? Math.max(...result.inferenceResponsiveness.longTasks.map(entry => entry.durationMs)) : 0;
+          result.warmSummarySeconds = {
+            mean: result.warmSeconds.reduce((sum, x) => sum + x, 0) / result.warmSeconds.length,
+            min: Math.min(...result.warmSeconds),
+            max: Math.max(...result.warmSeconds)
+          };
+          result.memory = await memorySnapshot();
+          result.wasmResources = performance.getEntriesByType('resource')
+            .filter(entry => entry.name.endsWith('.wasm'))
+            .map(entry => ({ name: entry.name, transferSize: entry.transferSize, encodedBodySize: entry.encodedBodySize, durationMs: entry.duration }));
+          result.status = 'complete';
+          await session.release();
+        } catch (error) {
+          result.status = 'error';
+          result.error = { name: error?.name, message: error?.message || String(error), stack: error?.stack };
+          result.firstResultSecondsFromFetchStart = (performance.now() - totalStart) / 1000;
+        }
+        finish(result, output, longTaskObserver);
+      }
+
+      function finish(result, output, observer) {
+        observer?.disconnect();
+        output.textContent = JSON.stringify(result, null, 2);
+        window.RESULT = result;
+      }
+
+      run();
+    })();
+  </script>
+</body>
+</html>

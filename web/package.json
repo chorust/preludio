@@ -1,0 +1,27 @@
+{
+  "name": "@chorust/preludio",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "pkg",
+    "README.md"
+  ],
+  "scripts": {
+    "build:wasm": "cargo build --release --no-default-features --features wasm --target wasm32-unknown-unknown --lib && wasm-bindgen --target web --out-dir pkg ../target/wasm32-unknown-unknown/release/preludio.wasm",
+    "build:ts": "tsc --project tsconfig.build.json --emitDeclarationOnly && bun build src/index.ts --outdir dist --target browser --format esm --sourcemap=external && cp pkg/preludio_bg.wasm dist/preludio_bg.wasm",
+    "build": "bun run build:wasm && bun run build:ts",
+    "test": "bun test",
+    "smoke": "bun smoke/server.ts"
+  },
+  "dependencies": {
+    "onnxruntime-web": "1.30.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  }
+}

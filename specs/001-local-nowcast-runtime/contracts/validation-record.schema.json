@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chorust/preludio/schemas/validation-record.schema.json",
+  "title": "Preludio reference validation record",
+  "description": "Written by `preludio replay --record` (native) or the web smoke page. A target enters supported_targets only with a passing validation record and a passing measurement record ($defs/measurement).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "target", "model_sha256", "input", "tolerance", "result", "created_at"],
+  "properties": {
+    "kind": { "const": "validation" },
+    "target": { "$ref": "#/$defs/target" },
+    "model_sha256": { "$ref": "model-package.schema.json#/$defs/sha256" },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry", "sha256"],
+      "properties": {
+        "entry": { "enum": ["raw_frames", "tensor"], "description": "raw_frames covers preprocessing + inference; tensor covers inference only." },
+        "sha256": { "$ref": "model-package.schema.json#/$defs/sha256" },
+        "preprocessed_matches_reference": { "type": "boolean", "description": "raw_frames only: bit-exact equality with reference/input.npy." }
+      }
+    },
+    "tolerance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rtol", "atol"],
+      "properties": { "rtol": { "const": 0.0001 }, "atol": { "const": 0.00001 } }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_abs_error", "mean_abs_error", "failures", "elements", "pass"],
+      "properties": {
+        "max_abs_error": { "type": "number" },
+        "mean_abs_error": { "type": "number" },
+        "failures": { "type": "integer", "minimum": 0 },
+        "elements": { "type": "integer", "minimum": 1 },
+        "pass": { "type": "boolean" }
+      }
+    },
+    "created_at": { "$ref": "forecast-metadata.schema.json#/$defs/utc" }
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "device", "os", "engine", "engine_version", "provider", "threads"],
+      "properties": {
+        "platform": { "type": "string" },
+        "device": { "type": "string", "description": "e.g. Apple M4 Pro, 14 cores." },
+        "os": { "type": "string" },
+        "browser": { "type": "string", "description": "Web only, with version." },
+        "engine": { "enum": ["onnxruntime", "onnxruntime-web"] },
+        "engine_version": { "type": "string" },
+        "provider": { "enum": ["cpu", "wasm"] },
+        "threads": { "type": "integer", "minimum": 1 },
+        "cross_origin_isolated": { "type": "boolean" }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "target", "model_sha256", "load_s", "cold_s", "warm_s", "peak_memory_mib", "memory_method", "budget", "pass", "created_at"],
+      "properties": {
+        "kind": { "const": "measurement" },
+        "target": { "$ref": "#/$defs/target" },
+        "model_sha256": { "$ref": "model-package.schema.json#/$defs/sha256" },
+        "load_s": { "type": "number", "description": "Package load + hash + session creation." },
+        "cold_s": { "type": "number" },
+        "warm_s": { "type": "array", "items": { "type": "number" }, "minItems": 5 },
+        "peak_memory_mib": { "type": "number" },
+        "memory_method": { "enum": ["rusage_max_rss", "measureUserAgentSpecificMemory"] },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["warm_max_s", "memory_max_mib"],
+          "properties": { "warm_max_s": { "const": 8 }, "memory_max_mib": { "const": 1740.8 } }
+        },
+        "pass": { "type": "boolean", "description": "max(warm_s) <= warm_max_s and peak_memory_mib <= memory_max_mib." },
+        "created_at": { "$ref": "forecast-metadata.schema.json#/$defs/utc" }
+      }
+    }
+  }
+}

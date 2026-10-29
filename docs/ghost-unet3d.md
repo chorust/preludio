@@ -19,28 +19,31 @@ The initial checkpoint is `step_22000.ckpt` from the Onix run
 | Parameters | 7,515,108 |
 | Input | float32 `[1, 4, 448, 448]`, oldest frame first |
 | Output | float32 `[1, 20, 448, 448]`, earliest lead first |
-| Configured cadence | 6 minutes |
-| Configured forecast leads | +6 through +120 minutes from the latest input |
-| Tensor values | Normalized training grayscale PNG intensities in `[0, 1]` |
+| Configured cadence | 6 minutes in the training configuration; runtime inputs need only be strictly increasing in time |
+| Configured forecast leads | +6 through +120 minutes in the fixed training/reference configuration; runtime leads use output tensor count and input average interval |
+| Tensor values | Normalized grayscale values in `[0, 1]` |
 | Output activation | `relu6(x) / 6` |
 | Export | ONNX opset 18; fixed batch, time, and spatial dimensions |
 
-The input frames cover 18 minutes between the first and last observations.
-Forecast leads describe the configuration; parity checks do not establish
-forecast accuracy at those leads.
+The recorded input frames cover 18 minutes between the first and last observations. These cadence and lead values describe that training/reference configuration; numerical parity does not establish forecast accuracy or constrain runtime input intervals.
 
-The training pipeline converts grayscale PNG pixels to float32, divides by
-255, and resizes to 448 x 448 with bilinear interpolation and antialiasing.
+For the recorded experiment, grayscale PNG bytes were converted to float32, divided by
+255, and resized to 448 x 448 with bilinear interpolation and antialiasing.
 This run uses no rotation. It transports the resized tensor as float16 and
 casts it back to float32 before the network. A fixture reproducing this run
-should include that rounding step.
+should include that rounding step. This describes the fixed reference path; it
+does not establish that the grayscale extraction matches duckomo gray or that
+the repository implements a Duckomo conversion.
 
-The PNG-to-physical-dBZ mapping and geographic grid have not been established
-from the supplied configuration. The manifest leaves both unset. Do not feed
-Radiust dBZ fields directly into this model or label its normalized output as
-dBZ, rain rate, or precipitation probability without verifying the data
-encoding and grid first. Missing observations and no-echo pixels also need
-separate semantics before live integration.
+The supplied configuration does not establish a physical dBZ mapping or
+geographic grid; neither is required by the current raw-u8 runtime contract.
+Inputs must be single-channel u8 gray values whose meaning matches duckomo
+gray. This repository has no evidence of a Duckomo conversion implementation
+or a concrete Radiust source supplying those bytes. Do not feed dBZ fields
+directly into this model or label normalized outputs as dBZ, rain rate, or
+precipitation probability. Missing and OutsideCoverage quality values are
+rejected; a valid no-echo value is u8 zero. The optional zero threshold is
+strictly less than its value and runs before `/255` and resize.
 
 ## Export and verify
 
@@ -52,8 +55,10 @@ uv pip install --python .venv/bin/python -r tools/requirements-export.txt
 .venv/bin/python -m unittest discover -s tools -p 'test_*.py' -v
 ```
 
-To recreate the real input used for the recorded validation, use these four
-six-minute PNG observations from station AZ9002, in chronological order:
+The documented reproduction recipe for the fixed validation uses these four
+six-minute PNG observations from station AZ9002, in chronological order. Its
+grayscale extraction is not evidence of a Duckomo conversion or compatibility
+with a concrete Radiust source:
 
 ```sh
 uv pip install --python .venv/bin/python pillow==12.2.0
@@ -86,6 +91,7 @@ MODEL_RUN="$ONIX_ROOT/outputs/radar_video_prediction/ghost_unet3d_wmse/2026-10-2
 .venv/bin/python tools/export_ghost_unet3d.py \
   --onix-root "$ONIX_ROOT" \
   --checkpoint "$MODEL_RUN/checkpoints/step_22000.ckpt" \
+  --run ghost_unet3d_wmse/2026-10-23_23-54-23 \
   --config "$MODEL_RUN/.hydra/config.yaml" \
   --input artifacts/ghost-unet3d-input/input.npy \
   --output artifacts/ghost-unet3d-step-22000
@@ -95,6 +101,15 @@ The output directory must be new or empty. `--input` accepts a preprocessed
 float32 NumPy array with the exact input shape and finite values in `[0, 1]`.
 Omitting it creates a deterministic synthetic input; the validation report
 records which input was used. Synthetic parity is not a forecast evaluation.
+
+`--run` is required and must identify the training run that produced the supplied
+checkpoint. It is recorded verbatim in `origin.checkpoint.run`; the exporter does
+not infer it from the checkpoint's filename or location.
+
+The training configuration must set `datamodule.rot: 0` and
+`datamodule.transport_dtype: float16`. The exporter rejects other values before
+loading model source or checkpoint weights, because the package preprocessing
+contract specifies no rotation and includes float16 rounding.
 
 The script reads the Onix model source directly. It does not construct a
 Lightning trainer, enable `torch.compile`, or modify the training repository.
@@ -121,10 +136,12 @@ not a sustained benchmark or a measurement of macOS hardware.
 
 ## Recorded CPU validation
 
-On 2026-10-24, the original 732 x 732 PNG observations from 09:24 through
-09:42 UTC on 2023-11-30 were preprocessed as described above. The resulting
-input range was `[0, 0.058837890625]`; the reference forecast range was
-`[0, 0.07919428497552872]`. This is one real observation window, not a test set.
+On 2026-10-24, the fixed reference input was associated with original 732 x 732
+PNG observations from 09:24 through 09:42 UTC on 2023-11-30. The recorded input
+range was `[0, 0.058837890625]`. This is one real observation window, not a test
+set. The artifacts validate only the fixed input and default no-threshold path;
+they do not establish Duckomo-compatible gray extraction, arbitrary positive
+input dimensions, or non-default threshold behavior.
 
 | Measurement | Result |
 | --- | --- |
@@ -159,8 +176,34 @@ parameters are unchanged.
 
 ## Deployment boundary
 
-The checked execution provider is CPU. macOS Core ML, browser WASM, and actual
-device latency and memory remain to be tested.
+The checked execution providers are native CPU (Linux ARM64 above; macOS
+arm64 in the [runtime research](../specs/001-local-nowcast-runtime/research.md))
+and ONNX Runtime Web WASM (below, plus Chrome 150 and Safari 26.6 in the same
+research). On macOS, native ORT must be pinned to the CPU provider: automatic
+device selection placed part of the graph on CoreML and failed parity.
+
+### WASM CPU check
+
+On 2026-10-24 the same `model.onnx` and `input.npy` ran on the
+`onnxruntime-web` 1.30.0 WASM execution provider under Bun 1.4.3 on an Apple
+M4 Pro (14 cores, macOS). This is a JavaScript runtime, not a browser. Conv3D,
+3D MaxPool, and Resize all ran without unsupported-operator errors.
+
+| WASM threads | Session creation | Inference (run 1 / run 2) | Max abs error vs PyTorch | Tolerance failures |
+| --- | --- | --- | --- | --- |
+| 1 | 0.119 s | 7.744 s / 7.600 s | 9.40636e-7 | 0 |
+| 4 | 0.127 s | 2.242 s / 2.165 s | 9.40636e-7 | 0 |
+
+Mean absolute error was 4.94896e-9 and the maximum difference from the Linux
+ONNX Runtime CPU forecast was 4.91738e-7. Process RSS was about 1.7 GiB,
+including the JavaScript runtime; it is not an isolated model peak. Browsers
+only allow WASM threads on cross-origin isolated pages (COOP/COEP); otherwise
+expect the single-thread time. Chrome’s earlier fixed-reference and memory
+records are historical evidence, not current support: a later headless
+four-thread run took 21.15–28.60 s warm and had a 1064.54 ms maximum rAF gap,
+so the Chrome target is no longer registered. Safari is not currently
+supported. The standard four-thread browser and ten-run offline acceptance
+remain incomplete; see the [runtime validation records](../specs/001-local-nowcast-runtime/quickstart.md).
 
 This network contains 3D convolutions. As checked on 2026-10-24, the ONNX Runtime WebGPU
 [operator support table](https://github.com/microsoft/onnxruntime/blob/main/js/web/docs/webgpu-operators.md)
@@ -168,7 +211,8 @@ marks Conv3D unsupported. Export success therefore does not establish
 WebGPU compatibility. Browser GPU deployment needs a compatible model or a
 separately validated operator conversion.
 
-Radiust integration also requires the physical value encoding, geographic
-grid, missing-data policy, and timestamp checks described above. The Rust crate
-still exposes its initial placeholder API; this experiment adds deployment
-tooling without selecting a public runtime API.
+The current runtime contract does not require physical value conversion or
+georeferencing. Radiust integration still needs a concrete source that can
+provide duckomo-compatible raw u8 gray bytes and an end-to-end run. The adapter
+guide describes that boundary but does not establish the conversion or source
+compatibility; US5 remains incomplete.

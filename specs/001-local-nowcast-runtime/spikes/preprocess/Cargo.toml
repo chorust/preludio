@@ -1,0 +1,17 @@
+[package]
+name = "preprocess-parity"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "resize_cli"
+path = "src/main.rs"
+
+[features]
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+wasm-bindgen = { version = "=0.2.100", optional = true }

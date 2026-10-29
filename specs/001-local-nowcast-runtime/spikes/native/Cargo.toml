@@ -1,0 +1,40 @@
+[package]
+name = "native-spike"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[features]
+default = []
+ort-backend = ["dep:ndarray", "dep:ort"]
+tract-backend = ["dep:tract-onnx"]
+
+[dependencies]
+anyhow = "1.0"
+ndarray = { version = "0.17.1", optional = true }
+ort = { version = "=2.0.0-rc.15", features = ["coreml"], optional = true }
+tract-onnx = { version = "=0.23.9", optional = true }
+
+[[bin]]
+name = "ort-native"
+path = "src/bin/ort_native.rs"
+required-features = ["ort-backend"]
+
+[[bin]]
+name = "tract-native"
+path = "src/bin/tract_native.rs"
+required-features = ["tract-backend"]
+
+[[bin]]
+name = "npy-compare"
+path = "src/bin/npy_compare.rs"
+
+[[bin]]
+name = "ort-sweep"
+path = "src/bin/ort_sweep.rs"
+required-features = ["ort-backend"]
+
+[[bin]]
+name = "ort-owned"
+path = "src/bin/ort_owned.rs"
+required-features = ["ort-backend"]

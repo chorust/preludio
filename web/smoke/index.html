@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preludio Web smoke test</title>
+  <style>
+    :root { color-scheme: light dark; font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    body { max-width: 1000px; margin: 2rem auto; padding: 0 1rem; }
+    h1, h2 { line-height: 1.2; }
+    section { margin: 1.5rem 0; }
+    pre { padding: 1rem; border: 1px solid #8888; border-radius: .4rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: .6rem; }
+    button { padding: .55rem .8rem; font: inherit; }
+    button:disabled { opacity: .55; }
+    #status[data-state="error"] { color: #c33; }
+    #status[data-state="complete"] { color: #287a37; }
+    .muted { opacity: .75; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Preludio Web smoke test</h1>
+    <p class="muted">Runs one cold and five warm predictions against the reference tensors. Use <code>--no-isolation</code> to exercise the isolation error path.</p>
+    <p id="status" role="status" aria-live="polite" data-state="running">Loading model package and reference data…</p>
+    <div class="toolbar">
+      <button id="rerun" type="button" disabled>Run again</button>
+      <button id="download-validation" type="button" disabled>Download validation-web-chrome-ort-wasm.json</button>
+      <button id="download-measurement" type="button" disabled>Download measurement-web-chrome-ort-wasm.json</button>
+    </div>
+
+    <section>
+      <h2>Parity</h2>
+      <pre id="parity">Waiting for inference…</pre>
+    </section>
+    <section>
+      <h2>Timings</h2>
+      <pre id="timings">Waiting for inference…</pre>
+    </section>
+    <section>
+      <h2>Memory</h2>
+      <pre id="memory">Waiting for inference…</pre>
+    </section>
+    <section>
+      <h2>Forecast provenance and execution</h2>
+      <pre id="provenance">Waiting for forecast metadata…</pre>
+    </section>
+    <section>
+      <h2>Responsiveness and optional raw frames</h2>
+      <pre id="details">Waiting for inference…</pre>
+    </section>
+    <section>
+      <h2>Validation record</h2>
+      <pre id="validation-record">Not generated yet.</pre>
+    </section>
+    <section>
+      <h2>Measurement record</h2>
+      <pre id="measurement-record">Not generated yet.</pre>
+    </section>
+  </main>
+
+  <script type="module">
+    const PACKAGE_URL = '/artifacts/ghost-unet3d-step-22000';
+    const ORT_WASM_PATHS = '/ort/';
+    const RAW_FRAME_FILES = [
+      'AZ9002_20231130_092400Z.png',
+      'AZ9002_20231130_093000Z.png',
+      'AZ9002_20231130_093600Z.png',
+      'AZ9002_20231130_094200Z.png'
+    ];
+    const RTOL = 1e-4;
+    const ATOL = 1e-5;
+    const MEMORY_BUDGET_MIB = 1740.8;
+    const WARM_BUDGET_SECONDS = 8;
+
+    const statusNode = document.querySelector('#status');
+    const parityNode = document.querySelector('#parity');
+    const timingsNode = document.querySelector('#timings');
+    const memoryNode = document.querySelector('#memory');
+    const provenanceNode = document.querySelector('#provenance');
+    const detailsNode = document.querySelector('#details');
+    const validationNode = document.querySelector('#validation-record');
+    const measurementNode = document.querySelector('#measurement-record');
+    const rerunButton = document.querySelector('#rerun');
+    const validationButton = document.querySelector('#download-validation');
+    const measurementButton = document.querySelector('#download-measurement');
+
+    let session;
+    let latestRecords;
+
+    const pretty = value => JSON.stringify(value, null, 2);
+    const seconds = milliseconds => milliseconds / 1000;
+    const mib = bytes => bytes / (1024 * 1024);
+
+    function setStatus(message, state = 'running') {
+      statusNode.textContent = message;
+      statusNode.dataset.state = state;
+    }
+
+    async function requiredResponse(path) {
+      const response = await fetch(path);
+      if (!response.ok) throw new Error(`${path} request failed: ${response.status} ${response.statusText}`);
+      return response;
+    }
+
+    function parseNpy(buffer) {
+      const bytes = new Uint8Array(buffer);
+      if (bytes.length < 10 || bytes[0] !== 0x93 || new TextDecoder().decode(bytes.subarray(1, 6)) !== 'NUMPY') {
+        throw new Error('Invalid NPY magic');
+      }
+      const major = bytes[6];
+      const view = new DataView(buffer);
+      let headerLength;
+      let headerStart;
+      if (major === 1) {
+        headerLength = view.getUint16(8, true);
+        headerStart = 10;
+      } else if (major === 2 || major === 3) {
+        if (bytes.length < 12) throw new Error('Truncated NPY header');
+        headerLength = view.getUint32(8, true);
+        headerStart = 12;
+      } else {
+        throw new Error(`Unsupported NPY version ${major}.${bytes[7]}`);
+      }
+      const dataOffset = headerStart + headerLength;
+      if (dataOffset > bytes.length) throw new Error('Truncated NPY header');
+      const header = new TextDecoder().decode(bytes.subarray(headerStart, dataOffset));
+      const descrMatch = header.match(/['"]descr['"]\s*:\s*['"]([^'"]+)['"]/);
+      const shapeMatch = header.match(/['"]shape['"]\s*:\s*\(([^)]*)\)/);
+      if (!descrMatch || !shapeMatch) throw new Error('NPY header is missing dtype or shape');
+      const descr = descrMatch[1];
+      const shape = shapeMatch[1].split(',').map(part => part.trim()).filter(Boolean).map(Number);
+      if (!shape.length || shape.some(dimension => !Number.isSafeInteger(dimension) || dimension < 1)) {
+        throw new Error(`Unsupported NPY shape: ${shapeMatch[1]}`);
+      }
+      if (/fortran_order['"]?\s*:\s*True/.test(header)) throw new Error('Fortran-order NPY arrays are not supported');
+      if (descr.startsWith('>')) throw new Error(`Big-endian NPY arrays are not supported: ${descr}`);
+      const count = shape.reduce((product, dimension) => product * dimension, 1);
+      if (!Number.isSafeInteger(count)) throw new Error('NPY array is too large');
+      let data;
+      if (descr.endsWith('f4')) {
+        if (dataOffset % Float32Array.BYTES_PER_ELEMENT !== 0) throw new Error('Unaligned float32 NPY data');
+        if (dataOffset + count * 4 > buffer.byteLength) throw new Error('Truncated float32 NPY data');
+        data = new Float32Array(buffer, dataOffset, count);
+      } else if (descr.endsWith('f8')) {
+        if (dataOffset % Float64Array.BYTES_PER_ELEMENT !== 0) throw new Error('Unaligned float64 NPY data');
+        if (dataOffset + count * 8 > buffer.byteLength) throw new Error('Truncated float64 NPY data');
+        const doubles = new Float64Array(buffer, dataOffset, count);
+        data = Float32Array.from(doubles);
+      } else {
+        throw new Error(`Unsupported NPY dtype: ${descr}`);
+      }
+      return { data, shape, descr };
+    }
+
+    function summarizeParity(actual, expected) {
+      if (actual.length !== expected.length) {
+        throw new Error(`Output length ${actual.length} != reference length ${expected.length}`);
+      }
+      let maxAbs = 0;
+      let sumAbs = 0;
+      let failures = 0;
+      for (let index = 0; index < actual.length; index++) {
+        const value = actual[index];
+        const reference = expected[index];
+        const absolute = Math.abs(value - reference);
+        if (absolute > maxAbs) maxAbs = absolute;
+        sumAbs += absolute;
+        if (!Number.isFinite(value) || !Number.isFinite(reference) || absolute > ATOL + RTOL * Math.abs(reference)) failures++;
+      }
+      return {
+        max_abs_error: maxAbs,
+        mean_abs_error: sumAbs / actual.length,
+        failures,
+        elements: actual.length,
+        pass: failures === 0
+      };
+    }
+
+    function tensorFrameMetadata(manifest) {
+      const frameCount = manifest.observation.frames;
+      const firstTime = Date.UTC(2023, 10, 30, 9, 30, 0) / 1000;
+      return Array.from({ length: frameCount }, (_, index) => ({
+        id: `frame-${index}`,
+        source: 'reference/input.npy',
+        validTime: new Date((firstTime + index * 31 + index * index * 7) * 1000).toISOString()
+      }));
+    }
+
+    function beginResponsivenessProbe() {
+      const gaps = [];
+      let previous = 0;
+      let active = true;
+      const tick = timestamp => {
+        if (previous) gaps.push(timestamp - previous);
+        previous = timestamp;
+        if (active) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+      return {
+        async ready() { await new Promise(resolve => requestAnimationFrame(resolve)); },
+        async stop() {
+          active = false;
+          await new Promise(resolve => requestAnimationFrame(resolve));
+        },
+        snapshot() {
+          return {
+            samples: gaps.length,
+            max_raf_gap_ms: gaps.length ? Math.max(...gaps) : null,
+            mean_raf_gap_ms: gaps.length ? gaps.reduce((sum, gap) => sum + gap, 0) / gaps.length : null
+          };
+        }
+      };
+    }
+
+    async function measureMemory(samples, phase) {
+      if (typeof performance.measureUserAgentSpecificMemory !== 'function') return;
+      try {
+        const result = await performance.measureUserAgentSpecificMemory();
+        samples.push({ phase, bytes: result.bytes, mib: mib(result.bytes), breakdown: result.breakdown });
+      } catch (error) {
+        samples.errors ??= [];
+        samples.errors.push(`${phase}: ${String(error)}`);
+      }
+    }
+
+    function browserDescription() {
+      const brands = navigator.userAgentData?.brands ?? [];
+      const brand = brands.find(item => !/not.?brand/i.test(item.brand));
+      if (brand) return `${brand.brand} ${brand.version}`;
+      const patterns = [
+        ['Edg', /Edg\/([\d.]+)/],
+        ['Chrome', /(?:Chrome|Chromium)\/([\d.]+)/],
+        ['Firefox', /Firefox\/([\d.]+)/],
+        ['Safari', /Version\/([\d.]+).*Safari/]
+      ];
+      for (const [name, pattern] of patterns) {
+        const match = navigator.userAgent.match(pattern);
+        if (match) return `${name} ${match[1]}`;
+      }
+      return navigator.userAgent;
+    }
+
+    function recordTarget(execution) {
+      const threads = Math.max(1, Number(execution.threads) || navigator.hardwareConcurrency || 1);
+      return {
+        platform: String(execution.platform),
+        device: `${navigator.userAgentData?.model || navigator.platform || 'browser device'} (${threads} threads)`,
+        os: navigator.userAgentData?.platform || navigator.platform || 'unknown',
+        browser: browserDescription(),
+        engine: execution.engine,
+        engine_version: String(execution.engine_version),
+        provider: execution.provider,
+        threads,
+        cross_origin_isolated: globalThis.crossOriginIsolated === true
+      };
+    }
+
+    async function sha256(buffer) {
+      const digest = await crypto.subtle.digest('SHA-256', buffer);
+      return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+    }
+
+    function displayProvenance(forecast) {
+      const metadata = forecast.metadata;
+      const provenance = metadata.provenance;
+      provenanceNode.textContent = pretty({
+        kind: metadata.kind,
+        last_observation_time: provenance.last_observation_time,
+        valid_times: metadata.valid_times,
+        generated_at: provenance.generated_at,
+        model: provenance.model,
+        execution: provenance.execution
+      });
+    }
+
+    function downloadJson(filename, record) {
+      const blob = new Blob([`${pretty(record)}\n`], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    async function loadRawSequence(manifest) {
+      const paths = RAW_FRAME_FILES.map(name => `${PACKAGE_URL}/reference/frames/${name}`);
+      const responses = await Promise.all(paths.map(path => fetch(path)));
+      if (responses.every(response => response.status === 404)) return { status: 'absent' };
+      if (responses.some(response => !response.ok)) {
+        return { status: 'incomplete', message: `Found ${responses.filter(response => response.ok).length} of ${responses.length} expected PNG frames.` };
+      }
+      const images = [];
+      try {
+        for (const response of responses) {
+          images.push(await createImageBitmap(await response.blob()));
+        }
+        const firstImage = images[0];
+        if (!firstImage) return { status: 'incomplete', message: 'No PNG frames were loaded.' };
+        const shape = [firstImage.height, firstImage.width];
+        for (let index = 1; index < images.length; index++) {
+          const image = images[index];
+          if (image.height !== shape[0] || image.width !== shape[1]) {
+            throw new Error(`${RAW_FRAME_FILES[index]} is ${image.height}x${image.width}; expected ${shape[0]}x${shape[1]}`);
+          }
+        }
+        const frames = images.map((image, index) => {
+          const canvas = document.createElement('canvas');
+          canvas.width = image.width;
+          canvas.height = image.height;
+          const context = canvas.getContext('2d', { willReadFrequently: true });
+          if (!context) throw new Error('Could not create a 2D canvas context for raw PNG frames');
+          context.drawImage(image, 0, 0);
+          const rgba = context.getImageData(0, 0, image.width, image.height).data;
+          const values = new Uint8Array(image.width * image.height);
+          for (let pixel = 0; pixel < values.length; pixel++) values[pixel] = rgba[pixel * 4];
+          const filename = RAW_FRAME_FILES[index];
+          const match = filename.match(/_(\d{8})_(\d{6})Z\.png$/);
+          if (!match) throw new Error(`Cannot read observation time from ${filename}`);
+          const date = `${match[1].slice(0, 4)}-${match[1].slice(4, 6)}-${match[1].slice(6, 8)}`;
+          const time = `${match[2].slice(0, 2)}:${match[2].slice(2, 4)}:${match[2].slice(4, 6)}`;
+          return {
+            id: filename.replace(/\.png$/i, ''),
+            source: `reference/frames/${filename}`,
+            validTime: `${date}T${time}Z`,
+            values
+          };
+        });
+        const grid = { id: manifest.observation.grid.id, shape };
+        if (manifest.observation.grid.georeference) grid.georeference = manifest.observation.grid.georeference;
+        return {
+          status: 'available',
+          sequence: { grid, encoding: manifest.observation.encoding, zeroThreshold: 0, frames }
+        };
+      } finally {
+        for (const image of images) image.close();
+      }
+    }
+
+    async function runSmoke() {
+      latestRecords = undefined;
+      validationButton.disabled = true;
+      measurementButton.disabled = true;
+      validationNode.textContent = 'Not generated yet.';
+      measurementNode.textContent = 'Not generated yet.';
+      parityNode.textContent = 'Loading reference tensors…';
+      timingsNode.textContent = 'Loading package…';
+      memoryNode.textContent = 'Waiting for memory samples…';
+      provenanceNode.textContent = 'Waiting for forecast metadata…';
+      detailsNode.textContent = 'Measuring responsiveness…';
+      setStatus('Loading model package and reference data…');
+
+      let activeSession;
+      try {
+        const [manifestResponse, inputResponse, referenceResponse] = await Promise.all([
+          requiredResponse(`${PACKAGE_URL}/manifest.json`),
+          requiredResponse(`${PACKAGE_URL}/reference/input.npy`),
+          requiredResponse(`${PACKAGE_URL}/reference/reference.npy`)
+        ]);
+        let [manifest, inputBuffer, referenceBuffer] = await Promise.all([
+          manifestResponse.json(), inputResponse.arrayBuffer(), referenceResponse.arrayBuffer()
+        ]);
+        const inputSha256 = await sha256(inputBuffer);
+        const input = parseNpy(inputBuffer);
+        const reference = parseNpy(referenceBuffer);
+        inputBuffer = null;
+        referenceBuffer = null;
+        const { createSession } = await import('/dist/index.js');
+        setStatus('Creating session and loading ORT WASM...');
+        const loadStart = performance.now();
+        activeSession = await createSession({
+          packageUrl: PACKAGE_URL,
+          ortWasmPaths: ORT_WASM_PATHS,
+          policy: 'validation',
+          threads: 4
+        });
+        const loadSeconds = seconds(performance.now() - loadStart);
+        session = activeSession;
+        const memorySamples = [];
+        const probe = beginResponsivenessProbe();
+        await probe.ready();
+
+        const frames = tensorFrameMetadata(manifest);
+        setStatus('Running cold inference...');
+        const coldStart = performance.now();
+        let forecast = await activeSession.predictTensor(input.data, frames);
+        const coldSeconds = seconds(performance.now() - coldStart);
+        const parity = summarizeParity(forecast.values, reference.data);
+        const warmSeconds = [];
+        for (let index = 0; index < 5; index++) {
+          setStatus(`Running warm inference ${index + 1}/5...`);
+          const warmStart = performance.now();
+          forecast = await activeSession.predictTensor(input.data, frames);
+          warmSeconds.push(seconds(performance.now() - warmStart));
+        }
+        await probe.stop();
+        const lastForecastMetadata = forecast.metadata;
+        forecast = null;
+        setStatus('Measuring memory after warm runs...');
+        await measureMemory(memorySamples, 'after warm runs');
+        let rawFrameResult = { status: 'not checked' };
+        try {
+          rawFrameResult = await loadRawSequence(manifest);
+          if (rawFrameResult.status === 'available') {
+            const rawStart = performance.now();
+            const rawForecast = await activeSession.predict(rawFrameResult.sequence);
+            rawFrameResult.elapsed_s = seconds(performance.now() - rawStart);
+            rawFrameResult.parity = summarizeParity(rawForecast.values, reference.data);
+          }
+        } catch (error) {
+          rawFrameResult = { status: 'error', message: String(error) };
+        }
+
+        const target = recordTarget(activeSession.execution);
+        const createdAt = new Date().toISOString();
+        const validationRecord = {
+          kind: 'validation',
+          target,
+          model_sha256: manifest.model.sha256,
+          input: { entry: 'tensor', sha256: inputSha256 },
+          tolerance: { rtol: RTOL, atol: ATOL },
+          result: parity,
+          created_at: createdAt
+        };
+        const hasMeasuredMemory = memorySamples.length > 0;
+        const peakMemoryMiB = hasMeasuredMemory ? Math.max(...memorySamples.map(sample => sample.mib)) : null;
+        const maxWarmSeconds = Math.max(...warmSeconds);
+        const measurementRecord = hasMeasuredMemory ? {
+          kind: 'measurement',
+          target,
+          model_sha256: manifest.model.sha256,
+          load_s: loadSeconds,
+          cold_s: coldSeconds,
+          warm_s: warmSeconds,
+          peak_memory_mib: peakMemoryMiB,
+          memory_method: 'measureUserAgentSpecificMemory',
+          budget: { warm_max_s: WARM_BUDGET_SECONDS, memory_max_mib: MEMORY_BUDGET_MIB },
+          pass: maxWarmSeconds <= WARM_BUDGET_SECONDS && peakMemoryMiB <= MEMORY_BUDGET_MIB,
+          created_at: createdAt
+        } : undefined;
+
+        parityNode.textContent = pretty({ ...parity, rtol: RTOL, atol: ATOL, raw_frames: rawFrameResult.parity ?? null });
+        timingsNode.textContent = pretty({ load_s: loadSeconds, cold_s: coldSeconds, warm_s: warmSeconds });
+        memoryNode.textContent = pretty({
+          method: hasMeasuredMemory ? 'measureUserAgentSpecificMemory' : 'unavailable',
+          samples: memorySamples,
+          peak_memory_mib: peakMemoryMiB,
+          budget_mib: MEMORY_BUDGET_MIB,
+          measurement_record_available: Boolean(measurementRecord)
+        });
+        provenanceNode.textContent = pretty({
+          kind: lastForecastMetadata.kind,
+          last_observation_time: lastForecastMetadata.provenance.last_observation_time,
+          valid_times: lastForecastMetadata.valid_times,
+          generated_at: lastForecastMetadata.provenance.generated_at,
+          model: lastForecastMetadata.provenance.model,
+          execution: lastForecastMetadata.provenance.execution
+        });
+        detailsNode.textContent = pretty({
+          cross_origin_isolated: globalThis.crossOriginIsolated === true,
+          execution: activeSession.execution,
+          responsiveness: probe.snapshot(),
+          raw_frames: rawFrameResult
+        });
+        validationNode.textContent = pretty(validationRecord);
+        if (measurementRecord) measurementNode.textContent = pretty(measurementRecord);
+        else measurementNode.textContent = 'A measurement record needs performance.measureUserAgentSpecificMemory(), which is unavailable or denied in this browser.';
+
+        latestRecords = { validationRecord, measurementRecord };
+        validationButton.disabled = false;
+        measurementButton.disabled = !measurementRecord;
+        rerunButton.disabled = false;
+        setStatus(parity.pass ? 'Smoke test complete: parity passed.' : 'Smoke test complete: parity failed.', parity.pass ? 'complete' : 'error');
+      } catch (error) {
+        const detail = { name: error?.name, message: error?.message || String(error), category: error?.category, detail: error?.detail };
+        setStatus(`Smoke test failed: ${detail.message}`, 'error');
+        parityNode.textContent = pretty(detail);
+        timingsNode.textContent = 'No complete timing record was produced.';
+        detailsNode.textContent = pretty({ cross_origin_isolated: globalThis.crossOriginIsolated === true });
+        rerunButton.disabled = false;
+      } finally {
+        if (activeSession) await activeSession.dispose().catch(() => {});
+        session = undefined;
+      }
+    }
+
+    rerunButton.addEventListener('click', runSmoke);
+    validationButton.addEventListener('click', () => {
+      if (latestRecords?.validationRecord) downloadJson('validation-web-chrome-ort-wasm.json', latestRecords.validationRecord);
+    });
+    measurementButton.addEventListener('click', () => {
+      if (latestRecords?.measurementRecord) downloadJson('measurement-web-chrome-ort-wasm.json', latestRecords.measurementRecord);
+    });
+    runSmoke();
+  </script>
+</body>
+</html>

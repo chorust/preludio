@@ -1,0 +1,86 @@
+{
+  "torch_version": "2.8.0",
+  "torchvision_version": "0.23.0",
+  "cases": [
+    {
+      "name": "sparse_levels",
+      "input": "input_sparse_levels.npy",
+      "reference": "reference_sparse_levels.npy",
+      "input_shape": [
+        4,
+        73,
+        61
+      ],
+      "input_dtype": "uint8",
+      "output_size": [
+        44,
+        37
+      ],
+      "reference_dtype": "float32"
+    },
+    {
+      "name": "uniform_random_small",
+      "input": "input_uniform_random_small.npy",
+      "reference": "reference_uniform_random_small.npy",
+      "input_shape": [
+        4,
+        73,
+        61
+      ],
+      "input_dtype": "uint8",
+      "output_size": [
+        44,
+        37
+      ],
+      "reference_dtype": "float32"
+    },
+    {
+      "name": "all_zero_small",
+      "input": "input_all_zero_small.npy",
+      "reference": "reference_all_zero_small.npy",
+      "input_shape": [
+        4,
+        73,
+        61
+      ],
+      "input_dtype": "uint8",
+      "output_size": [
+        44,
+        37
+      ],
+      "reference_dtype": "float32"
+    },
+    {
+      "name": "uniform_random_full",
+      "input": "input_uniform_random_full.npy",
+      "reference": "reference_uniform_random_full.npy",
+      "input_shape": [
+        1,
+        732,
+        732
+      ],
+      "input_dtype": "uint8",
+      "output_size": [
+        448,
+        448
+      ],
+      "reference_dtype": "float32"
+    },
+    {
+      "name": "all_zero_full",
+      "input": "input_all_zero_full.npy",
+      "reference": "reference_all_zero_full.npy",
+      "input_shape": [
+        1,
+        732,
+        732
+      ],
+      "input_dtype": "uint8",
+      "output_size": [
+        448,
+        448
+      ],
+      "reference_dtype": "float32"
+    }
+  ]
+}

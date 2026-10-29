@@ -1,0 +1,147 @@
+{
+  "schema": "preludio.model-package/1",
+  "id": "ghost-unet3d-step-22000",
+  "model": {
+    "file": "model.onnx",
+    "sha256": "7c5a6ed7865c0c85054ce45b2fb0b2f66694453491f7e6acabba14ee51533de8",
+    "format": "onnx",
+    "opset": 18
+  },
+  "origin": {
+    "checkpoint": {
+      "file": "step_22000.ckpt",
+      "step": 22000,
+      "sha256": "c5d8b457ad603ff53502616e97cc048aee0b22ded033b91acc5742b88fbc4a12",
+      "run": "ghost_unet3d_wmse/2026-10-23_23-54-23"
+    },
+    "source_sha256": "366e590ec938e391c6a43f796254c8836915f1817e3250ba6eee3011254ff07d",
+    "config_sha256": "3b8b6dc349d78e840f086d4e78d3e374e31059a25a582525242008b040d09599",
+    "exporter": "tools/export_ghost_unet3d.py"
+  },
+  "observation": {
+    "frames": 4,
+    "cadence_seconds": 360,
+    "cadence_tolerance_seconds": 0,
+    "encoding": "training-grayscale-u8",
+    "grid": {
+      "id": "onix-station-png-732",
+      "shape": [
+        732,
+        732
+      ],
+      "georeferenced": false
+    },
+    "missing_policy": "reject"
+  },
+  "tensor_input": {
+    "name": "radar",
+    "dtype": "float32",
+    "shape": [
+      1,
+      4,
+      448,
+      448
+    ],
+    "axes": [
+      "batch",
+      "time",
+      "y",
+      "x"
+    ],
+    "range": [
+      0.0,
+      1.0
+    ]
+  },
+  "tensor_output": {
+    "name": "forecast",
+    "dtype": "float32",
+    "shape": [
+      1,
+      20,
+      448,
+      448
+    ],
+    "axes": [
+      "batch",
+      "lead_time",
+      "y",
+      "x"
+    ],
+    "range": [
+      0.0,
+      1.0
+    ]
+  },
+  "preprocessing": [
+    {
+      "op": "u8_div_255"
+    },
+    {
+      "op": "resize_bilinear_aa",
+      "height": 448,
+      "width": 448,
+      "align_corners": false
+    },
+    {
+      "op": "round_f16"
+    }
+  ],
+  "forecast": {
+    "lead_minutes": [
+      6,
+      12,
+      18,
+      24,
+      30,
+      36,
+      42,
+      48,
+      54,
+      60,
+      66,
+      72,
+      78,
+      84,
+      90,
+      96,
+      102,
+      108,
+      114,
+      120
+    ],
+    "encoding": "training-grayscale-normalized",
+    "grid": {
+      "id": "onix-station-png-732/448",
+      "shape": [
+        448,
+        448
+      ],
+      "georeferenced": false
+    }
+  },
+  "supported_targets": [
+    {
+      "id": "macos-arm64-ort-cpu",
+      "platform": "macos-arm64",
+      "engine": "onnxruntime",
+      "engine_version": "1.31.0",
+      "provider": "cpu",
+      "threads": 4,
+      "requires_cross_origin_isolation": false,
+      "validation": "reference/validation-macos-arm64.json",
+      "measurement": "reference/measurement-macos-arm64.json"
+    },
+    {
+      "id": "web-chrome-ort-wasm",
+      "platform": "web-chrome",
+      "engine": "onnxruntime-web",
+      "engine_version": "1.30.0",
+      "provider": "wasm",
+      "threads": 4,
+      "requires_cross_origin_isolation": true,
+      "validation": "reference/validation-web-chrome-ort-wasm.json",
+      "measurement": "reference/measurement-web-chrome-ort-wasm.json"
+    }
+  ]
+}
